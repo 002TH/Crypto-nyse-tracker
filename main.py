@@ -35,6 +35,7 @@ class Tracker:
 
     async def process_trade(self, symbol: str, price: float, is_buyer_maker: bool, qty: float):
         symbol = symbol.lower()
+
         if symbol in TRACKED_COINS:
             prev_price = self.tick_directions.get(symbol, {}).get("last_price", price)
             direction = 1 if price > prev_price else (-1 if price < prev_price else 0)
@@ -52,10 +53,8 @@ class Tracker:
             now = datetime.now(pytz.timezone(TIMEZONE))
             next_reset = (now + timedelta(minutes=15 - (now.minute % 15))).replace(second=0, microsecond=0)
             await asyncio.sleep((next_reset - now).total_seconds())
-
             current_tick = sum(data["direction"] for data in self.tick_directions.values())
             self.last_15min_close = current_tick
-            print(f"15min close: TICK={current_tick}")
 
 tracker = Tracker()
 
@@ -91,7 +90,9 @@ async def get_dashboard():
             <title>Crypto Market Breadth</title>
             <style>
                 body { font-family: monospace; text-align: center; padding: 20px; }
-                #metrics { border: 2px solid #000; padding: 15px; max-width: 300px; margin: 0 auto; }
+                #metrics { border: 2px solid #000; padding: 15px; max-width: 320px; margin: 0 auto; }
+                table { width: 100%; margin-top: 10px; border-collapse: collapse; }
+                th, td { border: 1px solid #000; padding: 5px; }
             </style>
         </head>
         <body>
@@ -100,7 +101,7 @@ async def get_dashboard():
             <script>
                 const ws = new WebSocket(`wss://${window.location.host}/ws`);
                 ws.onmessage = (event) => {
-                    document.getElementById('metrics').innerText = event.data;
+                    document.getElementById('metrics').innerHTML = event.data;
                 };
             </script>
         </body>
@@ -111,31 +112,47 @@ async def get_dashboard():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     while True:
-        # TICK
         current_tick = sum(data["direction"] for data in tracker.tick_directions.values())
-        tick_15min = tracker.last_15min_close if tracker.last_15min_close is not None else 0
+        tick_line = f"TICK: {current_tick:+d}"
+        if tracker.last_15min_close is not None:
+            tick_line += f" (15mins {tracker.last_15min_close:+d})"
 
-        # ADD
-        add = sum(
-            1 if tracker.tick_directions.get(symbol, {}).get("last_price", 0) > tracker.prev_closes.get(symbol, 0)
-            else -1 if tracker.tick_directions.get(symbol, {}).get("last_price", 0) < tracker.prev_closes.get(symbol, 0)
-            else 0
-            for symbol in TRACKED_COINS
-        )
+        sol_ratio = "∞" if tracker.sol_sell_volume == 0 else f"{tracker.sol_buy_volume/tracker.sol_sell_volume:.2f}:1"
+        sol_direction = "above" if tracker.sol_last_price and tracker.prev_closes.get(SOL_SYMBOL) and tracker.sol_last_price > tracker.prev_closes[SOL_SYMBOL] else "below"
 
-        # CVD
-        sol_ratio = "∞" if tracker.sol_sell_volume == 0 else f"{tracker.sol_buy_volume / tracker.sol_sell_volume:.2f}:1"
-        sol_trend = "above" if tracker.sol_last_price and tracker.prev_closes.get(SOL_SYMBOL) and tracker.sol_last_price > tracker.prev_closes[SOL_SYMBOL] else "below"
+        # Sort coins into above and below yesterday’s close
+        above = []
+        below = []
+        for coin in TRACKED_COINS:
+            last_price = tracker.tick_directions.get(coin, {}).get("last_price")
+            prev_close = tracker.prev_closes.get(coin)
+            if last_price and prev_close:
+                if last_price > prev_close:
+                    above.append(coin.upper())
+                elif last_price < prev_close:
+                    below.append(coin.upper())
 
-        now_utc = datetime.utcnow().strftime('%d-%b-%Y %H:%M UTC')
+        # Format table
+        max_len = max(len(above), len(below))
+        rows = []
+        for i in range(max_len):
+            row_above = above[i] if i < len(above) else ""
+            row_below = below[i] if i < len(below) else ""
+            rows.append(f"<tr><td>{row_above}</td><td>{row_below}</td></tr>")
+        table_html = f"""
+            <table>
+                <tr><th>Above</th><th>Below</th></tr>
+                {''.join(rows)}
+            </table>
+        """
 
         await websocket.send_text(
-            f"TICK: {current_tick:+} (15mins {tick_15min:+})\n"
-            f"ADD: {add:+}\n"
-            f"SOL CVD: {sol_ratio} ({sol_trend} yesterday’s close)\n\n"
-            f"{now_utc}"
+            f"{tick_line}<br>"
+            f"SOL CVD: {sol_ratio} ({sol_direction} yesterday’s close)<br><br>"
+            f"{table_html}<br>"
+            f"{datetime.now(pytz.timezone(TIMEZONE)).strftime('%d-%b-%Y %H:%M UTC')}"
         )
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2)
 
 if __name__ == "__main__":
     import uvicorn
