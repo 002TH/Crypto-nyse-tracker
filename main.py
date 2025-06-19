@@ -11,7 +11,7 @@ app = FastAPI()
 
 # Configuration
 TIMEZONE = "Africa/Lagos"
-TRACKED_COINS = ["btcusdt", "ethusdt"]  # For TICK and ADD
+TRACKED_COINS = ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt", "trxusdt", "adausdt", "suiusdt", "dogeusdt", "pepeusdt"]  # For TICK and ADD
 SOL_SYMBOL = "solusdt"  # For CVD
 
 class Tracker:
