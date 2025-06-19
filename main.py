@@ -9,15 +9,21 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
+# Configuration
 TIMEZONE = "UTC"
-TRACKED_COINS = ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt", "trxusdt", "adausdt", "suiusdt", "dogeusdt", "pepeusdt"]
+TRACKED_COINS = [
+    "btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt",
+    "trxusdt", "adausdt", "suiusdt", "dogeusdt", "pepeusdt"
+]
 SOL_SYMBOL = "solusdt"
 
 class Tracker:
     def __init__(self):
-        self.tick_directions = {}
+        self.tick_directions = {}  # TICK data
+        self.prev_closes = {}      # Yesterday's closes
         self.last_15min_close = None
-        self.prev_closes = {}
+
+        # CVD data for SOL
         self.sol_buy_volume = 0.0
         self.sol_sell_volume = 0.0
         self.sol_last_price = None
@@ -34,11 +40,14 @@ class Tracker:
 
     async def process_trade(self, symbol: str, price: float, is_buyer_maker: bool, qty: float):
         symbol = symbol.lower()
+
+        # TICK
         if symbol in TRACKED_COINS:
             prev_price = self.tick_directions.get(symbol, {}).get("last_price", price)
             direction = 1 if price > prev_price else -1 if price < prev_price else 0
             self.tick_directions[symbol] = {"last_price": price, "direction": direction}
 
+        # CVD (SOL only)
         if symbol == SOL_SYMBOL:
             self.sol_last_price = price
             if is_buyer_maker:
@@ -51,9 +60,10 @@ class Tracker:
             now = datetime.now(pytz.timezone(TIMEZONE))
             next_reset = (now + timedelta(minutes=15 - (now.minute % 15))).replace(second=0, microsecond=0)
             await asyncio.sleep((next_reset - now).total_seconds())
-            current_tick = sum(data["direction"] for data in self.tick_directions.values())
-            self.last_15min_close = current_tick
-            print(f"15min close: TICK={current_tick}")
+
+            tick_value = sum(data["direction"] for data in self.tick_directions.values())
+            self.last_15min_close = tick_value
+            print(f"15-min TICK close: {tick_value}")
 
 tracker = Tracker()
 
@@ -67,9 +77,10 @@ async def track_live_data():
     while True:
         try:
             streams = [f"{s}@trade" for s in TRACKED_COINS + [SOL_SYMBOL]]
-            async with websockets.connect(f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}") as ws:
+            url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
+            async with websockets.connect(url) as ws:
                 async for msg in ws:
-                    data = json.loads(msg)
+                    data = json.loads(msg)["data"]
                     await tracker.process_trade(
                         symbol=data["s"],
                         price=float(data["p"]),
@@ -85,11 +96,11 @@ async def get_dashboard():
     return HTMLResponse("""
     <html>
         <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Crypto Market Breadth</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
-                body { font-family: monospace; text-align: center; padding: 20px; }
-                #metrics { border: 2px solid #000; padding: 15px; max-width: 320px; margin: 0 auto; }
+                body { font-family: monospace; background: #f4f4f4; text-align: center; padding: 30px; }
+                #metrics { border: 2px solid #000; padding: 20px; background: #fff; display: inline-block; }
             </style>
         </head>
         <body>
@@ -97,8 +108,8 @@ async def get_dashboard():
             <div id="metrics">Loading...</div>
             <script>
                 const ws = new WebSocket(`wss://${window.location.host}/ws`);
-                ws.onmessage = (event) => {
-                    document.getElementById('metrics').innerText = event.data;
+                ws.onmessage = event => {
+                    document.getElementById("metrics").innerText = event.data;
                 };
             </script>
         </body>
@@ -109,9 +120,11 @@ async def get_dashboard():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     while True:
-        current_tick = sum(data["direction"] for data in tracker.tick_directions.values())
+        # TICK
+        tick = sum(data["direction"] for data in tracker.tick_directions.values())
         tick_15min = f"(15mins {tracker.last_15min_close:+d})" if tracker.last_15min_close is not None else ""
-        
+
+        # ADD
         add = sum(
             1 if tracker.tick_directions.get(symbol, {}).get("last_price", 0) > tracker.prev_closes.get(symbol, 0)
             else -1 if tracker.tick_directions.get(symbol, {}).get("last_price", 0) < tracker.prev_closes.get(symbol, 0)
@@ -119,16 +132,20 @@ async def websocket_endpoint(websocket: WebSocket):
             for symbol in TRACKED_COINS
         )
 
-        sol_ratio_val = tracker.sol_buy_volume / tracker.sol_sell_volume if tracker.sol_sell_volume > 0 else float('inf')
-        sol_ratio = f"{sol_ratio_val:.2f}:1" if sol_ratio_val != float('inf') else "∞"
-        sol_direction = "above" if tracker.sol_last_price and tracker.sol_last_price > tracker.prev_closes.get(SOL_SYMBOL, 0) else "below"
+        # CVD
+        buy = tracker.sol_buy_volume
+        sell = tracker.sol_sell_volume
+        ratio = (buy / sell) if sell > 0 else float("inf")
+        ratio_str = f"{ratio:.2f}:1" if ratio != float("inf") else "∞"
+        sol_close = tracker.prev_closes.get(SOL_SYMBOL, 0)
+        direction = "above" if tracker.sol_last_price and tracker.sol_last_price > sol_close else "below"
 
         now = datetime.now(pytz.timezone(TIMEZONE)).strftime('%d-%b-%Y %H:%M UTC')
 
         await websocket.send_text(
-            f"TICK: {current_tick:+d} {tick_15min}\n"
+            f"TICK: {tick:+d} {tick_15min}\n"
             f"ADD:  {add:+d}\n"
-            f"SOL CVD: {sol_ratio} ({sol_direction} yesterday’s close)\n\n"
+            f"SOL CVD: {ratio_str} ({direction} yesterday’s close)\n\n"
             f"{now}"
         )
         await asyncio.sleep(0.5)
