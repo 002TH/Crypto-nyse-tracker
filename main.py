@@ -9,26 +9,22 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
-# Configuration
+# CONFIGURATION
 TIMEZONE = "UTC"
-TRACKED_COINS = [
-    "btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt",
-    "trxusdt", "adausdt", "suiusdt", "dogeusdt", "pepeusdt"
-]
+TRACKED_COINS = ["btcusdt", "ethusdt", "solusdt", "xrpusdt", "bnbusdt", "trxusdt", "adausdt", "suiusdt", "dogeusdt", "pepeusdt"]
 SOL_SYMBOL = "solusdt"
 
 class Tracker:
     def __init__(self):
-        self.tick_directions = {}  # TICK data
-        self.prev_closes = {}      # Yesterday's closes
+        self.tick_directions = {}  # symbol -> {"last_price": float, "direction": int}
         self.last_15min_close = None
-
-        # CVD data for SOL
+        self.prev_closes = {}
         self.sol_buy_volume = 0.0
         self.sol_sell_volume = 0.0
         self.sol_last_price = None
 
     async def load_historical(self):
+        """Fetch yesterday's close using Binance 24hr ticker"""
         for symbol in TRACKED_COINS + [SOL_SYMBOL]:
             try:
                 data = requests.get(
@@ -40,14 +36,14 @@ class Tracker:
 
     async def process_trade(self, symbol: str, price: float, is_buyer_maker: bool, qty: float):
         symbol = symbol.lower()
-
+        
         # TICK
         if symbol in TRACKED_COINS:
-            prev_price = self.tick_directions.get(symbol, {}).get("last_price", price)
-            direction = 1 if price > prev_price else -1 if price < prev_price else 0
+            last = self.tick_directions.get(symbol, {}).get("last_price", price)
+            direction = 1 if price > last else (-1 if price < last else 0)
             self.tick_directions[symbol] = {"last_price": price, "direction": direction}
 
-        # CVD (SOL only)
+        # SOL CVD
         if symbol == SOL_SYMBOL:
             self.sol_last_price = price
             if is_buyer_maker:
@@ -58,12 +54,9 @@ class Tracker:
     async def run_15min_reset(self):
         while True:
             now = datetime.now(pytz.timezone(TIMEZONE))
-            next_reset = (now + timedelta(minutes=15 - (now.minute % 15))).replace(second=0, microsecond=0)
+            next_reset = (now + timedelta(minutes=15 - now.minute % 15)).replace(second=0, microsecond=0)
             await asyncio.sleep((next_reset - now).total_seconds())
-
-            tick_value = sum(data["direction"] for data in self.tick_directions.values())
-            self.last_15min_close = tick_value
-            print(f"15-min TICK close: {tick_value}")
+            self.last_15min_close = sum(d["direction"] for d in self.tick_directions.values())
 
 tracker = Tracker()
 
@@ -77,10 +70,9 @@ async def track_live_data():
     while True:
         try:
             streams = [f"{s}@trade" for s in TRACKED_COINS + [SOL_SYMBOL]]
-            url = f"wss://stream.binance.com:9443/stream?streams={'/'.join(streams)}"
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}") as ws:
                 async for msg in ws:
-                    data = json.loads(msg)["data"]
+                    data = json.loads(msg)
                     await tracker.process_trade(
                         symbol=data["s"],
                         price=float(data["p"]),
@@ -89,27 +81,27 @@ async def track_live_data():
                     )
         except Exception as e:
             print(f"WebSocket error: {e}")
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
 
 @app.get("/")
 async def get_dashboard():
     return HTMLResponse("""
     <html>
         <head>
-            <title>Crypto Market Breadth</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Crypto Market Breadth</title>
             <style>
-                body { font-family: monospace; background: #f4f4f4; text-align: center; padding: 30px; }
-                #metrics { border: 2px solid #000; padding: 20px; background: #fff; display: inline-block; }
+                body { font-family: monospace; text-align: center; padding: 20px; }
+                #metrics { border: 2px solid #000; padding: 15px; max-width: 320px; margin: 0 auto; white-space: pre-line; }
             </style>
         </head>
         <body>
-            <h1>CRYPTO MARKET BREADTH</h1>
+            <h2>CRYPTO MARKET BREADTH</h2>
             <div id="metrics">Loading...</div>
             <script>
                 const ws = new WebSocket(`wss://${window.location.host}/ws`);
-                ws.onmessage = event => {
-                    document.getElementById("metrics").innerText = event.data;
+                ws.onmessage = (event) => {
+                    document.getElementById('metrics').innerText = event.data;
                 };
             </script>
         </body>
@@ -120,11 +112,11 @@ async def get_dashboard():
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     while True:
-        # TICK
-        tick = sum(data["direction"] for data in tracker.tick_directions.values())
-        tick_15min = f"(15mins {tracker.last_15min_close:+d})" if tracker.last_15min_close is not None else ""
+        # TICK calculation
+        current_tick = sum(d["direction"] for d in tracker.tick_directions.values())
+        tick_15min = f"(15mins {tracker.last_15min_close:+})" if tracker.last_15min_close is not None else ""
 
-        # ADD
+        # ADD calculation
         add = sum(
             1 if tracker.tick_directions.get(symbol, {}).get("last_price", 0) > tracker.prev_closes.get(symbol, 0)
             else -1 if tracker.tick_directions.get(symbol, {}).get("last_price", 0) < tracker.prev_closes.get(symbol, 0)
@@ -132,20 +124,22 @@ async def websocket_endpoint(websocket: WebSocket):
             for symbol in TRACKED_COINS
         )
 
-        # CVD
-        buy = tracker.sol_buy_volume
-        sell = tracker.sol_sell_volume
-        ratio = (buy / sell) if sell > 0 else float("inf")
-        ratio_str = f"{ratio:.2f}:1" if ratio != float("inf") else "∞"
-        sol_close = tracker.prev_closes.get(SOL_SYMBOL, 0)
-        direction = "above" if tracker.sol_last_price and tracker.sol_last_price > sol_close else "below"
+        # CVD ratio
+        sol_ratio = (
+            f"{(tracker.sol_buy_volume / tracker.sol_sell_volume):.2f}:1"
+            if tracker.sol_sell_volume > 0 else "∞"
+        )
+        sol_vs_yesterday = tracker.prev_closes.get(SOL_SYMBOL)
+        sol_dir_text = ""
+        if sol_vs_yesterday and tracker.sol_last_price:
+            sol_dir_text = "(above yesterday’s close)" if tracker.sol_last_price > sol_vs_yesterday else "(below yesterday’s close)"
 
-        now = datetime.now(pytz.timezone(TIMEZONE)).strftime('%d-%b-%Y %H:%M UTC')
+        now = datetime.now(pytz.timezone(TIMEZONE)).strftime("%d-%b-%Y %H:%M %Z")
 
         await websocket.send_text(
-            f"TICK: {tick:+d} {tick_15min}\n"
-            f"ADD:  {add:+d}\n"
-            f"SOL CVD: {ratio_str} ({direction} yesterday’s close)\n\n"
+            f"TICK: {current_tick:+} {tick_15min}\n"
+            f"ADD: {add:+}\n"
+            f"SOL CVD: {sol_ratio} {sol_dir_text}\n\n"
             f"{now}"
         )
         await asyncio.sleep(0.5)
